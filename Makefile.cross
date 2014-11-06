@@ -32,11 +32,11 @@ else
 	LDFLAGS := -static
 endif
 	CFLAGS := -g -O -I $(PCAP_PATH)
-	LDFLAGS += -L$(PCAP_PATH) -lpcap -lpthread
+	LDFLAGS += -L$(PCAP_PATH) -lpcap -lpthread -lrt
 endif
 
 .PHONY: all
-all: version txPckt rxPckt
+all: version txPckt_a rxPckt_a
 
 .PHONY: version
 version:
@@ -49,14 +49,14 @@ version:
 	@date +'#define PRINT_VERS "Build at (%C%y.%m.%d-%T)"' >> version.h
 	@echo "" >> version.h
 
-txPckt: txPckt.c print.c
+txPckt_a: txPckt.c print.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-rxPckt: rxPckt.c print.c
+rxPckt_a: rxPckt.c print.c
 	${CC} ${CFLAGS} -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -f *.o txPckt rxPckt
+	rm -f *.o txPckt_a rxPckt_a
 
 .c.o:
 	${CC} ${CFLAGS} -c -o $*.o $<
