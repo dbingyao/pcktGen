@@ -29,11 +29,16 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/time.h>
+#include <net/if.h>
 #include <pcap.h>
 #include <pthread.h>
 
 #include "version.h"
+
+/* Use Fix MAC address */
+#define MAC_ADDR_FIX 1
 
 /* default packet length (maximum bytes per packet to capture) */
 #define PACKET_LEN 1460
@@ -77,7 +82,7 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
 /* Log packet to file */
-char log_file = 0;
+char log_file = 0, verbose = 0;
 char tfname[50], rfname[50];
 char fbin = 0;
 FILE *tx_f = NULL;
@@ -86,7 +91,7 @@ FILE *rx_f = NULL;
 int rx_fidx;
 
 /* statistics */
-int tx_cnt;
+int tx_cnt = 0;
 
 char my_mac_addr[6] = { 0x12, 0x21, 0x12, 0x21, 0x22, 0x23 };
 
@@ -157,7 +162,7 @@ static void log_packets(FILE ** fp, char *fname, int *fidx, const u_char * buf,
 				}
 			}
 		} else {
-open_file:
+	open_file:
 			sprintf(outf, fname, (*fidx)++);
 			hdr = (struct packet_header *)buf;
 			printf("Open %s to log packets, seq 0x%04x ... \n",
@@ -172,7 +177,9 @@ open_file:
 				*fidx = 1;
 		}
 
-		//printf("(%d) Write %d bytes to %s\n", pkt.hdr.seq_no, pkt.hdr.length, outf);
+	} else {
+
+		*fp = NULL;
 	}
 
 	if (fbin && *fp)
@@ -202,16 +209,19 @@ void *receive_packet(void *arg)
 		if (memcmp((void *)pkt_data, (void *)my_mac_addr, 6))
 			continue;
 
-		log_packets(&rx_f, rfname, &rx_fidx, pkt_data, pkthdr->len);
+		if (log_file || verbose)
+			log_packets(&rx_f, rfname, &rx_fidx, pkt_data, pkthdr->len);
 
 		p = (struct packet *)pkt_data;
-		if (need_ack && (p->hdr.flags & ACK)) {
-			/* signal main thread to continue sending packet */
-			pthread_cond_signal(&cond);
-		} else {
-			if (p->hdr.flags & ERR)
-				printf("Received ERR ack from client\n");
-			exit(EXIT_FAILURE);
+		if (need_ack) {
+			if (p->hdr.flags & ACK) {
+				/* signal main thread to continue sending packet */
+				pthread_cond_signal(&cond);
+			} else {
+				if (p->hdr.flags & ERR)
+					printf("Received ERR ack from client\n");
+				exit(EXIT_FAILURE);
+			}
 		}
 
 	}
@@ -239,10 +249,19 @@ void send_packet(void)
 	else
 		pkt.hdr.flags = 0;
 #endif
+
+#if (MAC_ADDR_FIX == 0)
+	*((int *) &pkt.hdr.dhost[0]) = random();
+	*((short *) &pkt.hdr.dhost[4]) = (short) random();
+
+	*((int *) &pkt.hdr.shost[0]) = random();
+	*((short *) &pkt.hdr.shost[4]) = (short) random();
+#endif
 	/* MTU is 1500 bytes minus HEADER_LEN */
 	ran = random();
 	ran = ran >> 16;
-	payload_sz = (unsigned short)((ran & 0x3ff) + (ran & 0x1ff));
+	//payload_sz = (unsigned short)((ran & 0x3ff) + (ran & 0x1ff));
+	payload_sz = 1500;
 
 	if (payload_sz < 64)
 		payload_sz = 64 - HEADER_LEN;
@@ -250,20 +269,62 @@ void send_packet(void)
 		payload_sz = 1500 - HEADER_LEN;
 
 	pkt.hdr.length = payload_sz + HEADER_LEN;
-	for (i = 0; i < payload_sz; i++)
-		pkt.msg[i] = (char)random();
+	for (i = 0; i < payload_sz; i+=4)
+		*((int *) &pkt.msg[i]) = random();
 
 	pkt.hdr.chksum = 0;
 	pkt.hdr.chksum = checksum((void *)&pkt, pkt.hdr.length);
 
-	log_packets(&tx_f, tfname, &tx_fidx, (const u_char *)&pkt,
-		    pkt.hdr.length);
+	if (log_file || verbose)
+		log_packets(&tx_f, tfname, &tx_fidx, (const u_char *)&pkt,
+			    pkt.hdr.length);
 
 	/* Send down the packet */
 	if (pcap_sendpacket(handle, (u_char *) & pkt, (HEADER_LEN + payload_sz))
 	    != 0) {
 		printf("Error sending the packet: %s\n", pcap_geterr(handle));
 	}
+}
+
+struct timespec diff(struct timespec start, struct timespec end)
+{
+        struct timespec temp;
+
+        if ((end.tv_nsec - start.tv_nsec) < 0) {
+                temp.tv_sec = end.tv_sec-start.tv_sec - 1;
+                temp.tv_nsec = 1000000000 + end.tv_nsec - start.tv_nsec;
+        } else {
+                temp.tv_sec = end.tv_sec - start.tv_sec;
+                temp.tv_nsec = end.tv_nsec - start.tv_nsec;
+        }
+
+        return temp;
+}
+
+static int get_interface_macaddr(const char *name)
+{
+        struct ifreq ifreq;
+        int err, fd;
+
+        memset(&ifreq, 0, sizeof(ifreq));
+        strcpy(ifreq.ifr_name, name);
+
+        fd = socket(PF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+                printf("socket failed: %m");
+                return -1;
+        }
+
+        err = ioctl(fd, SIOCGIFHWADDR, &ifreq);
+        if (err < 0) {
+                printf("ioctl SIOCGIFHWADDR failed: %m");
+                close(fd);
+                return -1;
+        }
+
+        memcpy(my_mac_addr, ifreq.ifr_hwaddr.sa_data, 6);
+        close(fd);
+        return 0;
 }
 
 static void usage(void)
@@ -273,7 +334,8 @@ static void usage(void)
 	       "\n"
 	       "[OPTION]\n"
 	       "    -a : require acknowledgement packet\n"
-	       "    -t <microseconds>: time to wait before send next packet, default:550\n"
+	       "    -t <nanoseconds>: time to wait before send next packet, default:550\n"
+	       "    -v : dump packet content to console\n"
 	       "    -b : log packet content to file as binary mode\n"
 	       "    -f <filenameprefix> : may include directory, write packets content"
 	       " to ./dir/<filename>-tx-xxx.log\n"
@@ -285,7 +347,8 @@ int main(int argc, char *argv[])
 	char errbuf[PCAP_ERRBUF_SIZE];
 	char dev[20];
 	int inum, i = 0;
-	useconds_t delay = 550;
+	struct timespec t0, t1, tdiff;
+	int delay = 50000000;
 
 	printf("txPckt: " PRINT_VERS "\n");
 
@@ -295,15 +358,15 @@ int main(int argc, char *argv[])
 	}
 
 	/* 1. load configuration */
-	while ((i = getopt(argc, argv, "abhf:t:")) != -1) {
+	while ((i = getopt(argc, argv, "abvhf:t:")) != -1) {
 		switch (i) {
 		case 'a':
 			need_ack = SYNC;
 			break;
 		case 't':
 			delay = strtoul(optarg, NULL, 10);
-			if (delay > 1000000)
-				delay = 600;
+			if (delay >= 1000000000)
+				delay -= 1;
 			break;
 		case 'b':
 			fbin = 1;
@@ -314,6 +377,9 @@ int main(int argc, char *argv[])
 			strcpy(rfname, optarg);
 			strcat(rfname, "-rx-%03d.log");
 			log_file = 1;
+			break;
+		case 'v':
+			verbose = 1;
 			break;
 		case 'h':
 		default:
@@ -332,6 +398,7 @@ int main(int argc, char *argv[])
 		}
 
 		/* Print the list */
+		i = 0;
 		for (d = alldevs; d; d = d->next) {
 			if (d->description)
 				printf("%d. %s\n", ++i, d->description);
@@ -389,7 +456,11 @@ int main(int argc, char *argv[])
 
 	tx_fidx = rx_fidx = 1;
 
-	printf("listening on %s...\n", dev);
+	get_interface_macaddr((const char *) dev);
+
+	printf("%02x:%02x:%02x:%02x:%02x:%02x ... listening on %s\n",
+		my_mac_addr[0], my_mac_addr[1], my_mac_addr[2],
+		my_mac_addr[3], my_mac_addr[4] & 0xff, my_mac_addr[5],dev);
 
 	if (pthread_create(&rx_thread, NULL, receive_packet, NULL)) {
 		printf("Rx Thread creation failed\n");
@@ -398,7 +469,7 @@ int main(int argc, char *argv[])
 
 	if (signal(SIGINT, sig_handler) == SIG_ERR)
 		printf("\ncan't catch SIGINT\n");
-
+#if MAC_ADDR_FIX
 	pkt.hdr.dhost[0] = 0x08;
 	pkt.hdr.dhost[1] = 0x08;
 	pkt.hdr.dhost[2] = 0x08;
@@ -412,16 +483,19 @@ int main(int argc, char *argv[])
 	pkt.hdr.shost[3] = my_mac_addr[3];
 	pkt.hdr.shost[4] = my_mac_addr[4];
 	pkt.hdr.shost[5] = my_mac_addr[5];
-
+#endif
 	/* arbitary number prevent known ethertype */
 	pkt.hdr.proto = 0x87a;
 
+	if (clock_gettime(CLOCK_MONOTONIC, &t0) < 0)
+		printf("t0: clock_gettime failed\n");
+
+	srandom(t0.tv_nsec);
 	do {
 		send_packet();
 
 		if (need_ack) {
 			int rc;
-			struct timespec ts;
 			struct timeval tp;
 
 			if (gettimeofday(&tp, NULL) != 0) {
@@ -430,12 +504,12 @@ int main(int argc, char *argv[])
 			}
 
 			/* Convert from timeval to timespec */
-			ts.tv_sec = tp.tv_sec;
-			ts.tv_nsec = tp.tv_usec * 1000;
-			ts.tv_sec += 2;
+			t0.tv_sec = tp.tv_sec;
+			t0.tv_nsec = tp.tv_usec * 1000;
+			t0.tv_sec += 2;
 
 			pthread_mutex_lock(&mutex);
-			rc = pthread_cond_timedwait(&cond, &mutex, &ts);
+			rc = pthread_cond_timedwait(&cond, &mutex, &t0);
 			if (rc == ETIMEDOUT) {
 				printf("Wait timed out!\n");
 				pthread_mutex_unlock(&mutex);
@@ -443,8 +517,26 @@ int main(int argc, char *argv[])
 			}
 			pthread_mutex_unlock(&mutex);
 		} else {
-			usleep(delay);
+			if (clock_gettime(CLOCK_MONOTONIC, &t0) < 0)
+				printf("t0: clock_gettime failed\n");
+#if 1
+			do {
+				if (clock_gettime(CLOCK_MONOTONIC, &t1) < 0) {
+					printf("t0: clock_gettime failed\n");
+					return 0;
+				}
+
+				tdiff = diff(t0, t1);
+				if (tdiff.tv_nsec > delay) {
+					break;
+				}
+			} while(1);
+#else
+			if (delay)
+				usleep(delay);
+#endif
 		}
+	//} while (tx_cnt < 4100);
 	} while (1);
 
 	return 0;
