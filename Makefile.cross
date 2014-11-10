@@ -49,10 +49,10 @@ version:
 	@date +'#define PRINT_VERS "Build at (%C%y.%m.%d-%T)"' >> version.h
 	@echo "" >> version.h
 
-txPckt_a: txPckt.c print.c
+txPckt_a: txPckt.c if.c print.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-rxPckt_a: rxPckt.c print.c
+rxPckt_a: rxPckt.c if.c print.c
 	${CC} ${CFLAGS} -o $@ $^ $(LDFLAGS)
 
 clean:
