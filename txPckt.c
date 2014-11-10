@@ -29,54 +29,23 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
-#include <sys/ioctl.h>
-#include <sys/time.h>
-#include <net/if.h>
-#include <pcap.h>
 #include <pthread.h>
 
 #include "version.h"
+#include "common.h"
 
 /* Use Fix MAC address */
 #define MAC_ADDR_FIX 1
 
-/* default packet length (maximum bytes per packet to capture) */
-#define PACKET_LEN 1460
-
-/* flags value inside header: 
- * - SYNC : client need to send acknowledgment packets.
- * - ACK : this is ack packet from client, check the ack_no
- *         if necessary to know ack for which seq_no packet.
- * - CRC : client side has CRC or others error happen 
- */
-#define SYNC 0x1
-#define ACK 0x2
-#define ERR 0x4
-
-struct packet_header {
-	unsigned char dhost[6];
-	unsigned char shost[6];
-	unsigned short proto;
-	unsigned char flags;
-	unsigned char over;
-	unsigned int seq_no;
-	unsigned int ack_no;
-	unsigned short length;
-	unsigned short chksum;
-};
-
-struct packet {
-	struct packet_header hdr;
-	char msg[PACKET_LEN];
-};
-
-#define HEADER_LEN (sizeof(struct packet_header))
+struct iphdr iph;
+struct tcphdr tcph;
 
 pcap_t *handle;
-struct packet pkt;
+char pkt[PACKET_LEN];
 
 /* Expect to receive acknowlegment from client */
 char need_ack = 0;
+char insert_iphdr = 1, insert_tcphdr = 0;
 pthread_t rx_thread;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
@@ -93,7 +62,8 @@ int rx_fidx;
 /* statistics */
 int tx_cnt = 0;
 
-char my_mac_addr[6] = { 0x12, 0x21, 0x12, 0x21, 0x22, 0x23 };
+unsigned char my_mac_addr[6] = { 0x12, 0x21, 0x12, 0x21, 0x22, 0x23 };
+unsigned char dest_mac_addr[6] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x08 };
 
 static void log_packets(FILE ** fp, char *fname, int *fidx, const u_char * buf,
 			int len);
@@ -118,23 +88,31 @@ void sig_handler(int signo)
 	}
 }
 
-/*--------------------------------------------------------------------*/
-/*--- checksum - standard 1s complement checksum                   ---*/
-/*--------------------------------------------------------------------*/
-unsigned short checksum(void *b, int len)
+/*
+ * Generic checksum calculation function
+ */
+unsigned short csum(unsigned short *ptr,int nbytes) 
 {
-	unsigned short *buf = b;
-	unsigned int sum = 0;
-	unsigned short result;
+	register long sum;
+	unsigned short oddbyte;
+	register short answer;
 
-	for (sum = 0; len > 1; len -= 2)
-		sum += *buf++;
-	if (len == 1)
-		sum += *(unsigned char *)buf;
-	sum = (sum >> 16) + (sum & 0xFFFF);
-	sum += (sum >> 16);
-	result = ~sum;
-	return result;
+	sum=0;
+	while(nbytes>1) {
+		sum+=*ptr++;
+		nbytes-=2;
+	}
+	if(nbytes==1) {
+		oddbyte=0;
+		*((u_char*)&oddbyte)=*(u_char*)ptr;
+		sum+=oddbyte;
+	}
+
+	sum = (sum>>16)+(sum & 0xffff);
+	sum = sum + (sum>>16);
+	answer=(short)~sum;
+
+	return(answer);
 }
 
 static void log_packets(FILE ** fp, char *fname, int *fidx, const u_char * buf,
@@ -142,7 +120,7 @@ static void log_packets(FILE ** fp, char *fname, int *fidx, const u_char * buf,
 {
 	char outf[80];
 	int pos;
-	struct packet_header *hdr;
+	struct tcphdr *hdr;
 
 	if (log_file) {
 		if (*fp) {
@@ -164,9 +142,9 @@ static void log_packets(FILE ** fp, char *fname, int *fidx, const u_char * buf,
 		} else {
 	open_file:
 			sprintf(outf, fname, (*fidx)++);
-			hdr = (struct packet_header *)buf;
+			hdr = (struct tcphdr *) (buf + TCPHDR_OFFSET);
 			printf("Open %s to log packets, seq 0x%04x ... \n",
-			       outf, hdr->seq_no);
+			       outf, hdr->seq);
 			*fp = fopen(outf, "wb");
 			if (*fp == NULL) {
 				perror("fopen");
@@ -195,7 +173,6 @@ void *receive_packet(void *arg)
 {
 	struct pcap_pkthdr *pkthdr;
 	const u_char *pkt_data;
-	struct packet *p;
 	int res;
 
 	while (handle) {
@@ -212,13 +189,12 @@ void *receive_packet(void *arg)
 		if (log_file || verbose)
 			log_packets(&rx_f, rfname, &rx_fidx, pkt_data, pkthdr->len);
 
-		p = (struct packet *)pkt_data;
 		if (need_ack) {
-			if (p->hdr.flags & ACK) {
+			if (pkt_data[PAYLOAD_OFFSET] & ACK) {
 				/* signal main thread to continue sending packet */
 				pthread_cond_signal(&cond);
 			} else {
-				if (p->hdr.flags & ERR)
+				if (pkt_data[PAYLOAD_OFFSET] & ERR)
 					printf("Received ERR ack from client\n");
 				exit(EXIT_FAILURE);
 			}
@@ -229,61 +205,140 @@ void *receive_packet(void *arg)
 
 void send_packet(void)
 {
+	struct pseudo_header psh;
+	char *pseudogram;
 	unsigned short payload_sz;
 	int i = 0;
 	long ran;
-	int status;
 
-	/* overflow */
-	if ((tx_cnt + 1) > 0xffffffff) {
-		pkt.hdr.over += 1;
-		tx_cnt = 0;
-	}
-	pkt.hdr.seq_no = ++tx_cnt;
-	pkt.hdr.ack_no = 0xffffffff;
 #if 1
-	pkt.hdr.flags = need_ack;
+	pkt[PAYLOAD_OFFSET] = need_ack;
 #else
-	if ((pkt.hdr.seq_no % 0x2000) == 0)
-		pkt.hdr.flags = SYNC;
+	if ((tcph->seq % 0x2000) == 0)
+		pkt[PAYLOAD_OFFSET] = SYNC;
 	else
-		pkt.hdr.flags = 0;
+		pkt[PAYLOAD_OFFSET] = 0;
 #endif
 
 #if (MAC_ADDR_FIX == 0)
-	*((int *) &pkt.hdr.dhost[0]) = random();
-	*((short *) &pkt.hdr.dhost[4]) = (short) random();
+	*((int *) &pkt[0]) = random();
+	*((short *) &pkt[4]) = (short) random();
 
-	*((int *) &pkt.hdr.shost[0]) = random();
-	*((short *) &pkt.hdr.shost[4]) = (short) random();
+	*((int *) &pkt[6]) = random();
+	*((short *) &pkt[10]) = (short) random();
 #endif
-	/* MTU is 1500 bytes minus HEADER_LEN */
+	/* MTU is 1514 bytes minus HEADER_LEN */
 	ran = random();
 	ran = ran >> 16;
 	//payload_sz = (unsigned short)((ran & 0x3ff) + (ran & 0x1ff));
-	payload_sz = 1500;
+	payload_sz = 20;
 
-	if (payload_sz < 64)
-		payload_sz = 64 - HEADER_LEN;
-	else if (payload_sz + HEADER_LEN > 1500)
-		payload_sz = 1500 - HEADER_LEN;
+	if (!payload_sz)
+		payload_sz = 20;
+	else if (payload_sz + HEADER_LEN > PACKET_LEN)
+		payload_sz = PACKET_LEN - HEADER_LEN;
 
-	pkt.hdr.length = payload_sz + HEADER_LEN;
-	for (i = 0; i < payload_sz; i+=4)
-		*((int *) &pkt.msg[i]) = random();
+	//Ip checksum
+	iph.tot_len = htons(sizeof (struct iphdr) + sizeof (struct tcphdr) + payload_sz);
+	iph.check = 0;      //Set to 0 before calculating checksum
+	iph.check = csum ((unsigned short *) &iph, sizeof (struct iphdr));
+	//printf("IP checksum: 0x%04x\n", iph.check);
+	memcpy((pkt + IPHDR_OFFSET), (char *)&iph, sizeof(struct iphdr));
 
-	pkt.hdr.chksum = 0;
-	pkt.hdr.chksum = checksum((void *)&pkt, pkt.hdr.length);
+	for (i = (PAYLOAD_OFFSET + 1); i < (PAYLOAD_OFFSET + payload_sz); i+=4)
+		*((int *) &pkt[i]) = random();
+
+	tcph.check = 0;      //Set to 0 before calculating checksum
+	tcph.seq = htonl(++tx_cnt);
+	//Now the TCP checksum
+	psh.source_address = iph.saddr;
+	psh.dest_address = iph.daddr;
+	psh.placeholder = 0;
+	psh.protocol = IPPROTO_TCP;
+	psh.tcp_length = htons(sizeof(struct tcphdr) + payload_sz);
+
+	int psize = sizeof(struct pseudo_header) + sizeof(struct tcphdr) + payload_sz;
+	pseudogram = malloc(psize);
+
+	memcpy(pseudogram , (char*) &psh , sizeof (struct pseudo_header));
+	memcpy(pseudogram + sizeof(struct pseudo_header) , (char*) &tcph , sizeof(struct tcphdr));
+	memcpy(pseudogram + sizeof(struct pseudo_header) + sizeof(struct tcphdr), &pkt[PAYLOAD_OFFSET] , payload_sz);
+
+	tcph.check = csum( (unsigned short*) pseudogram , psize);
+
+	//printf("TCP checksum: 0x%04x\n", tcph.check);
+	memcpy((pkt + TCPHDR_OFFSET), (char *)&tcph, sizeof(struct tcphdr));
 
 	if (log_file || verbose)
 		log_packets(&tx_f, tfname, &tx_fidx, (const u_char *)&pkt,
-			    pkt.hdr.length);
+			    (HEADER_LEN + payload_sz));
 
 	/* Send down the packet */
 	if (pcap_sendpacket(handle, (u_char *) & pkt, (HEADER_LEN + payload_sz))
 	    != 0) {
 		printf("Error sending the packet: %s\n", pcap_geterr(handle));
 	}
+}
+
+
+static void prepare_header(const char *name)
+{
+	struct ethhdr *eth = (struct ethhdr *) pkt;
+	unsigned long my_addr;
+	char dest_addr[16];
+	int i;
+
+#if MAC_ADDR_FIX
+	for (i=0; i< 6; i++) {
+		pkt[i] = dest_mac_addr[i];
+		pkt[i + 6] = my_mac_addr[i];
+	}
+#endif
+	if (insert_iphdr)
+		eth->h_proto = htons(0x0800);
+	else
+		eth->h_proto = 0x87a; // arbitary number prevent known ethertype
+
+	//Fill in the IP Header
+	memset(&iph, 0 , sizeof(struct iphdr));
+	iph.ihl = 5;
+	iph.version = 4;
+	iph.tos = 0;
+	iph.id = htonl (54321); //Id of this packet
+	iph.frag_off = 0;
+	iph.ttl = 255;
+     
+	get_interface_ipaddr(name, AF_INET, (unsigned char *) &my_addr, 4);
+	iph.saddr = my_addr;
+
+	if (!get_dest_ipaddr(name, dest_addr))
+		iph.daddr = inet_addr (dest_addr);
+	else //Get dest IP failed, just fill with arbitary IP
+		iph.daddr = inet_addr ("10.0.0.68");
+
+	if (insert_tcphdr)
+		iph.protocol = IPPROTO_TCP;
+	else
+		iph.protocol = ~IPPROTO_TCP;
+	memcpy((pkt + IPHDR_OFFSET), (char *)&iph, sizeof(struct iphdr));
+
+	//Fill in TCP Header
+	memset(&tcph, 0 , sizeof(struct tcphdr));
+	tcph.source = htons (3234);
+	tcph.dest = htons (3248);
+	tcph.seq = 0;
+	tcph.ack_seq = 0;
+	tcph.doff = 5;  //tcp header size
+	tcph.fin=0;
+	tcph.syn=0;
+	tcph.rst=0;
+	tcph.psh=0;
+	tcph.ack=0;
+	tcph.urg=0;
+	tcph.window = htons (5840); /* maximum allowed window size */
+	tcph.check = 0; //leave checksum 0 now, filled later by pseudo header
+	tcph.urg_ptr = 0;
+	memcpy((pkt + TCPHDR_OFFSET), (char *)&tcph, sizeof(struct tcphdr));
 }
 
 struct timespec diff(struct timespec start, struct timespec end)
@@ -299,32 +354,6 @@ struct timespec diff(struct timespec start, struct timespec end)
         }
 
         return temp;
-}
-
-static int get_interface_macaddr(const char *name)
-{
-        struct ifreq ifreq;
-        int err, fd;
-
-        memset(&ifreq, 0, sizeof(ifreq));
-        strcpy(ifreq.ifr_name, name);
-
-        fd = socket(PF_INET, SOCK_DGRAM, 0);
-        if (fd < 0) {
-                printf("socket failed: %m");
-                return -1;
-        }
-
-        err = ioctl(fd, SIOCGIFHWADDR, &ifreq);
-        if (err < 0) {
-                printf("ioctl SIOCGIFHWADDR failed: %m");
-                close(fd);
-                return -1;
-        }
-
-        memcpy(my_mac_addr, ifreq.ifr_hwaddr.sa_data, 6);
-        close(fd);
-        return 0;
 }
 
 static void usage(void)
@@ -456,11 +485,16 @@ int main(int argc, char *argv[])
 
 	tx_fidx = rx_fidx = 1;
 
-	get_interface_macaddr((const char *) dev);
+	get_interface_macaddr((const char *) dev, my_mac_addr);
+	get_dest_macaddr((const char *) dev, dest_mac_addr);
 
 	printf("%02x:%02x:%02x:%02x:%02x:%02x ... listening on %s\n",
 		my_mac_addr[0], my_mac_addr[1], my_mac_addr[2],
 		my_mac_addr[3], my_mac_addr[4] & 0xff, my_mac_addr[5],dev);
+
+	printf("send packets to %02x:%02x:%02x:%02x:%02x:%02x\n",
+		dest_mac_addr[0], dest_mac_addr[1], dest_mac_addr[2],
+		dest_mac_addr[3], dest_mac_addr[4] & 0xff, dest_mac_addr[5]);
 
 	if (pthread_create(&rx_thread, NULL, receive_packet, NULL)) {
 		printf("Rx Thread creation failed\n");
@@ -469,23 +503,8 @@ int main(int argc, char *argv[])
 
 	if (signal(SIGINT, sig_handler) == SIG_ERR)
 		printf("\ncan't catch SIGINT\n");
-#if MAC_ADDR_FIX
-	pkt.hdr.dhost[0] = 0x08;
-	pkt.hdr.dhost[1] = 0x08;
-	pkt.hdr.dhost[2] = 0x08;
-	pkt.hdr.dhost[3] = 0x08;
-	pkt.hdr.dhost[4] = 0x08;
-	pkt.hdr.dhost[5] = 0x08;
 
-	pkt.hdr.shost[0] = my_mac_addr[0];
-	pkt.hdr.shost[1] = my_mac_addr[1];
-	pkt.hdr.shost[2] = my_mac_addr[2];
-	pkt.hdr.shost[3] = my_mac_addr[3];
-	pkt.hdr.shost[4] = my_mac_addr[4];
-	pkt.hdr.shost[5] = my_mac_addr[5];
-#endif
-	/* arbitary number prevent known ethertype */
-	pkt.hdr.proto = 0x87a;
+	prepare_header((const char *) dev);
 
 	if (clock_gettime(CLOCK_MONOTONIC, &t0) < 0)
 		printf("t0: clock_gettime failed\n");
@@ -536,7 +555,7 @@ int main(int argc, char *argv[])
 				usleep(delay);
 #endif
 		}
-	//} while (tx_cnt < 4100);
+	//} while (tx_cnt < 5);
 	} while (1);
 
 	return 0;
