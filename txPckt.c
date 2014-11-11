@@ -42,6 +42,7 @@ struct tcphdr tcph;
 
 pcap_t *handle;
 char pkt[PACKET_LEN];
+char pseudogram[PSEUDO_SIZE];
 
 /* Expect to receive acknowlegment from client */
 char need_ack = 0;
@@ -206,7 +207,6 @@ void *receive_packet(void *arg)
 void send_packet(void)
 {
 	struct pseudo_header psh;
-	char *pseudogram;
 	unsigned short payload_sz;
 	int i = 0;
 	long ran;
@@ -256,9 +256,7 @@ void send_packet(void)
 	psh.placeholder = 0;
 	psh.protocol = IPPROTO_TCP;
 	psh.tcp_length = htons(sizeof(struct tcphdr) + payload_sz);
-
 	int psize = sizeof(struct pseudo_header) + sizeof(struct tcphdr) + payload_sz;
-	pseudogram = malloc(psize);
 
 	memcpy(pseudogram , (char*) &psh , sizeof (struct pseudo_header));
 	memcpy(pseudogram + sizeof(struct pseudo_header) , (char*) &tcph , sizeof(struct tcphdr));
