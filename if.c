@@ -48,7 +48,12 @@ void get_arp(void)
 	file = fopen(filename, "r");
 	if (file) {
 		char line [256];
-		fgets(line, sizeof(line), file);
+
+		//remove the first line
+		//IP address       HW type     Flags       HW address            Mask     Device
+		if (!fgets(line, sizeof(line), file))
+			return;
+
 		while (fgets(line, sizeof(line), file))
 		{
 			char  a,b,c;
