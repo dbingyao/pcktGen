@@ -31,8 +31,6 @@
 #include <netinet/if_ether.h> ////Provides declarations for ethernet header
 #include <net/if.h>
 
-#include <pcap.h>
-
 /* default packet length (maximum bytes per packet to capture) */
 #define PACKET_LEN 1514
 
@@ -67,6 +65,7 @@ struct pseudo_header {
 /* ethernet headers are always exactly 14 bytes [1] */
 #define SIZE_ETHERNET 14
 
+extern void print_payload(const u_char * payload, int len, FILE * fp);
 
 extern int get_dest_macaddr(const char *name, unsigned char *mac); 
 extern int get_dest_ipaddr(const char *name, char *addr);

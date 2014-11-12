@@ -30,8 +30,8 @@
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
+#include <pcap.h>
 
-#include "version.h"
 #include "common.h"
 
 /* Use Fix MAC address */
@@ -46,7 +46,7 @@ char pseudogram[PSEUDO_SIZE];
 
 /* Expect to receive acknowlegment from client */
 char need_ack = 0;
-char insert_iphdr = 1, insert_tcphdr = 0;
+char insert_iphdr = 1, insert_tcphdr = 1;
 pthread_t rx_thread;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
@@ -68,8 +68,6 @@ unsigned char dest_mac_addr[6] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x08 };
 
 static void log_packets(FILE ** fp, char *fname, int *fidx, const u_char * buf,
 			int len);
-
-extern void print_payload(const u_char * payload, int len, FILE * fp);
 
 void sig_handler(int signo)
 {
@@ -231,7 +229,7 @@ void send_packet(void)
 	ran = random();
 	ran = ran >> 16;
 	//payload_sz = (unsigned short)((ran & 0x3ff) + (ran & 0x1ff));
-	payload_sz = 20;
+	payload_sz = PACKET_LEN - HEADER_LEN;
 
 	if (!payload_sz)
 		payload_sz = 20;
@@ -322,16 +320,16 @@ static void prepare_header(const char *name)
 
 	//Fill in TCP Header
 	memset(&tcph, 0 , sizeof(struct tcphdr));
-	tcph.source = htons (3234);
-	tcph.dest = htons (3248);
+	tcph.source = htons (46930);
+	tcph.dest = htons (50001);
 	tcph.seq = 0;
 	tcph.ack_seq = 0;
 	tcph.doff = 5;  //tcp header size
-	tcph.fin=0;
-	tcph.syn=0;
-	tcph.rst=0;
+	tcph.fin=1;
+	tcph.syn=1;
+	tcph.rst=1;
 	tcph.psh=0;
-	tcph.ack=0;
+	tcph.ack=1;
 	tcph.urg=0;
 	tcph.window = htons (5840); /* maximum allowed window size */
 	tcph.check = 0; //leave checksum 0 now, filled later by pseudo header
@@ -377,7 +375,7 @@ int main(int argc, char *argv[])
 	struct timespec t0, t1, tdiff;
 	int delay = 50000000;
 
-	printf("txPckt: " PRINT_VERS "\n");
+	printf("txPkct: build at %s, %s\n", __DATE__, __TIME__);
 
 	if (getuid() != 0) {
 		printf("%s: root privelidges needed\n", *(argv + 0));

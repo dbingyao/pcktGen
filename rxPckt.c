@@ -21,10 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pcap.h>
-
-#include "version.h"
-#include "common.h"
-
 #include <unistd.h>
 #include <ctype.h>
 #include <errno.h>
@@ -34,11 +30,11 @@
 #include <arpa/inet.h>
 
 
+#include "common.h"
+
 void
 got_packet(u_char * args, const struct pcap_pkthdr *header,
 	   const u_char * packet);
-
-extern void print_payload(const u_char * payload, int len, FILE * fp);
 
 pcap_t *handle;
 char my_mac_addr[ETHER_ADDR_LEN] = { 0x08, 0x08, 0x08, 0x08, 0x08, 0x08 };
@@ -174,7 +170,7 @@ int main(int argc, char *argv[])
 	int i = 0;
 	unsigned short chksum;
 
-	printf("rxPckt: " PRINT_VERS "\n");
+	printf("rxPkct: build at %s, %s\n", __DATE__, __TIME__);
 
 	if (getuid() != 0) {
 		fprintf(stderr, "%s: root privelidges needed\n", *(argv + 0));
